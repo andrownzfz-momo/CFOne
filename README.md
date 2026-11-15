@@ -221,6 +221,115 @@ node scripts/deploy.mjs --token <CF_API_TOKEN> --account <ACCOUNT_ID> --mode pag
 
 **推荐**：在 Workers/Pages 的「运行时设置」中将**兼容性日期**设为 `2026-01-20`。
 
+### 方式二·详细分步（纯控制台，不用任何工具）
+
+> 没有 exe / 不想跑脚本时，照这个走。全程在 Cloudflare 控制台点鼠标。
+
+**步骤 1：创建 KV 命名空间**
+
+左侧菜单 **Workers 和 Pages** → 顶部 **KV** 标签 → **Create namespace** → 名字随意（如 `cfone-kv`）→ 创建。
+记下返回的 **Namespace ID**（一串 32 位十六进制）。
+
+**步骤 2：新建 Worker**
+
+左侧 **Workers 和 Pages** → **Create** → **Worker** → 起名（如 `cfone`）→ **Deploy**。
+
+**步骤 3：粘贴代码**
+
+点进刚建的 Worker → **Edit code**（在线编辑器）→ 全选删掉默认内容 → 粘贴 `dist/CFOne-worker.js` 的**全部内容** → **Save and deploy**。
+
+**步骤 4：设置变量 `A`**
+
+Worker 详情 → **Settings** → **Variables and Secrets** → **Add**：
+
+| 字段 | 填什么 |
+| --- | --- |
+| Variable name | `A` |
+| Value | 你的面板密码（长随机串，如 `ded98a79260487ac6c8b3d32`） |
+| Type | `Text` |
+
+→ **Save**。
+
+**步骤 5：绑定 KV**
+
+同一页面 **Settings** → **Bindings** → **Add** → **KV namespace**：
+
+| 字段 | 填什么 |
+| --- | --- |
+| Variable name | `K`（必须是大写 K） |
+| KV namespace | 选步骤 1 创建的命名空间 |
+
+→ **Save** → 重新 **Deploy** 一次。
+
+**步骤 6：确认兼容性日期**
+
+**Settings** → **Version** / **Compatibility date** → 设为 `2026-01-20`。
+
+**步骤 7：拿到访问地址（关键，很多人卡这）**
+
+Worker 详情顶部会显示访问地址。**Cloudflare 的完整地址必须带账号子域**：
+
+```
+https://<Worker名>.<账号子域>.workers.dev
+```
+
+- 你的 Worker 名：`cfone`
+- 你的账号子域：**Workers 和 Pages** 首页顶部能看到（如 `andrownzfz`）
+- 完整地址：`https://cfone.andrownzfz.workers.dev`
+
+> ⚠️ 少了中间那段 `<账号子域>.` 的短地址 `https://cfone.workers.dev` **DNS 不存在，打不开**。
+
+**步骤 8：访问面板**
+
+```
+https://<Worker名>.<账号子域>.workers.dev/<步骤4设置的A值>
+```
+
+例：`https://cfone.andrownzfz.workers.dev/ded98a79260487ac6c8b3d32`
+
+### 访问不通排查：`error code: 1042`
+
+**症状**：地址能解析、不是超时，但返回 `HTTP 404` + `error code: 1042`。换脚本、重部署、换 Token 都没用。
+
+**根因**：账号的 **workers.dev 通配路由未启用**（API 里 `wildcard_host: false`）。边缘收到请求，但拒绝转给任何 Worker，于是吐 1042。
+
+**这不是脚本 / KV / Token / 权限的问题** —— 部署本身是成功的，只是「访问通道」没开。
+
+**判断方法**（任一条命中即为该问题）：
+
+1. 部署返回成功（脚本列表里能看到、bindings 正确），但访问任何路径都 1042
+2. 用一个只 `return new Response("ok")` 的最小脚本测试，**也是 1042** → 证明与脚本无关
+3. API 查 `GET /accounts/{id}/workers/settings` 返回 `wildcard_host: false`
+
+**解决（控制台手动开，1 分钟）**：
+
+1. 登录 https://dash.cloudflare.com
+2. 左侧 **Workers 和 Pages** → 首页顶部/右上找 **Workers.dev 子域** 设置（⚙️ 或 Settings）
+3. 打开开关：**Enable workers.dev**（子域值应与你地址中间那段一致，如 `andrownzfz`）
+4. **等 1~2 分钟**让路由生效
+5. 用完整地址重访
+
+> 该开关 **API 不开放**（PUT/PATCH 全部 405/409），只能控制台点。
+
+**备用方案：绑定自定义域名（不依赖 workers.dev，一定通）**
+
+若找不到开关或开了仍 1042，用你账号下已接入的域名：
+
+1. Worker 详情 → **Settings** → **Domains & Routes** → **Add Custom Domain**
+2. 输入子域，如 `cf.你的域名.com`（需该域名已接入 Cloudflare）
+3. 按提示在 **DNS** 加一条 CNAME，目标指向该 Worker（控制台会给出确切值）
+4. 等 DNS 生效 + 证书签发（几分钟）
+5. 访问 `https://cf.你的域名.com/<A的值>`
+
+**其他常见访问问题**：
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 打开是「Welcome to Cloudflare」欢迎页 | 访问了根路径，或密码路径不对 | 必须带 `/密码` 路径：`https://.../<A的值>` |
+| 一直转圈 / 超时 | `*.workers.dev` 被本地网络阻断 | 开代理，或改用上面的自定义域名方案 |
+| HTTP 000 连不上 | 地址写成短子域（少了 `.账号子域.`） | 用完整地址 `https://<名>.<账号子域>.workers.dev` |
+| 403 / 登录失败 | 密码错或会话过期 | 重新输入 `A` 的值登录 |
+
 ## 使用
 
 1. 浏览器打开 `https://<部署地址>/<A的值>`，输入面板密码登录
