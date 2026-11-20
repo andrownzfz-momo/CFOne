@@ -72,6 +72,20 @@ console.log('=== CFOne 冒烟测试 ===\n');
   check('面板页面含登录表单', html.includes('btn-login'));
 }
 
+// 2b. 根路径直接进面板（免记 /密码 路径）
+{
+  const env = makeEnv();
+  const res = await call('/', env);
+  const html = await res.text();
+  check('根路径直接返回面板登录页', res.status === 200 && html.includes('btn-login'));
+  // fake=yes 时根路径仍伪装
+  const envFake = makeEnv();
+  envFake.fake = 'yes';
+  const resFake = await call('/', envFake);
+  const htmlFake = await resFake.text();
+  check('fake=yes 根路径返回伪装页', !htmlFake.includes('btn-login'));
+}
+
 // 3. 错误密码登录被拒
 {
   const env = makeEnv();

@@ -213,6 +213,7 @@ function defaultConfig() {
     api: false,
     freeCpu: false, // Free CPU 预算保护（每连接 384KiB/96 块）
     jk: false,      // 家宽链式订阅入口
+    fake: false,    // 根路径伪装开关（默认 false=根路径直接面板）
     version: '',
   };
 }
@@ -240,6 +241,7 @@ function envConfig(env) {
     freeCpu: g('freecpu').toLowerCase() === 'yes' || g('freecpu') === '1' || g('freecpu') === 'on' || g('freecpu') === 'true',
     jk: g('jk').toLowerCase() === 'yes' || g('jk') === '1' || g('jk') === 'on' || g('jk') === 'true',
     jkNodes: parseJkNodes(g('jk_node')),
+    fake: g('fake').toLowerCase() === 'yes' || g('fake') === '1' || g('fake') === 'on' || g('fake') === 'true',
     version: '',
   };
 }
@@ -486,7 +488,16 @@ async function route(request, env, ctx) {
     }
   }
 
-  // 4) 其它：伪装页（不读 KV）
+  // 4) 根路径 → 面板登录页（直接访问，免记 /密码 路径；无密码或 fake=yes 时仍伪装）
+  if (method === 'GET' && (path === '/' || path === '')) {
+    if (pw && !envCfg.fake) {
+      const cfg = await loadCfg(env);
+      return handlePanelLoginPage(request, env, ctx, cfg);
+    }
+    // 无密码 / fake=yes → 落到下方伪装页
+  }
+
+  // 5) 其它：伪装页（不读 KV）
   return maskResponse(request, env, ctx, method === 'GET' ? 200 : 405);
 }
 

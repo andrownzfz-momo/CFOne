@@ -132,6 +132,7 @@ function defaultConfig() {
     api: false,
     freeCpu: false, 
     jk: false,      
+    fake: false,    
     version: '',
   };
 }
@@ -158,6 +159,7 @@ function envConfig(env) {
     freeCpu: g('freecpu').toLowerCase() === 'yes' || g('freecpu') === '1' || g('freecpu') === 'on' || g('freecpu') === 'true',
     jk: g('jk').toLowerCase() === 'yes' || g('jk') === '1' || g('jk') === 'on' || g('jk') === 'true',
     jkNodes: parseJkNodes(g('jk_node')),
+    fake: g('fake').toLowerCase() === 'yes' || g('fake') === '1' || g('fake') === 'on' || g('fake') === 'true',
     version: '',
   };
 }
@@ -386,6 +388,15 @@ async function route(request, env, ctx) {
     if (path === cfg.wsPath) {
       return handleXhttp(request, envCfg, cfg);
     }
+  }
+
+  
+  if (method === 'GET' && (path === '/' || path === '')) {
+    if (pw && !envCfg.fake) {
+      const cfg = await loadCfg(env);
+      return handlePanelLoginPage(request, env, ctx, cfg);
+    }
+    
   }
 
   
