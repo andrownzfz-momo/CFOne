@@ -14,6 +14,8 @@
 | **协议** | VLESS/WS、Trojan/WS、**VLESS-XHTTP（stream-one）**；XHTTP 与 WS 共用路径，靠 method 区分（POST→XHTTP、Upgrade→WS） |
 | **出站** | 直连 / ProxyIP 竞速、SOCKS5 / HTTP / HTTPS 代理、出站方式三选一（竞速/直连优先/只走代理）；Path 级 `pyip` / `s` / `qj` 单节点覆盖 |
 | **面板** | 图形化管理：UUID、WS 路径、Trojan 开关、ProxyIP、出站代理、优选 IP 列表（KV 持久化）、伪装页 |
+| **保护** | **Free CPU 预算保护**（`freeCpu=yes`）：每连接双向合计 ≤384 KiB 且 ≤96 块，超限断开，防止免费账号 CPU 超额 |
+| **家宽** | **家宽链式**（`jk=yes` + `?format=jk/vg/jiakuan`）：CF 入口经 `dialer-proxy` 接家宽出口（客户端→家宽→CF→目标），内置含**美国**多出口池，可用 `JK_NODE` 覆盖 |
 
 ## API Token 权限清单
 
@@ -338,7 +340,7 @@ https://<Worker名>.<账号子域>.workers.dev/<步骤4设置的A值>
 3. 在「设置」页配置 UUID、WS 路径、Trojan、出站等
 4. 在「概览」页复制订阅地址，导入客户端
 
-### 订阅格式（9 种）
+### 订阅格式（9 种 + 家宽链式入口）
 
 订阅地址默认按客户端 UA 自动适配；也可显式加 `?format=` 指定：
 
@@ -353,10 +355,19 @@ https://<Worker名>.<账号子域>.workers.dev/<步骤4设置的A值>
 | `xhttp` | VLESS-XHTTP 链接 | 支持 XHTTP 的客户端 |
 | `base64` | Base64 链接集 | v2rayN / Shadowrocket / NekoBox |
 | `plain` | 明文链接集 | 浏览器 / 通用 |
+| `vg` / `jk` / `jiakuan` | **家宽链式 Clash YAML**（需 `jk=yes`） | 支持链式的 Clash / Mihomo |
 
 例：`https://<部署地址>/s/<订阅令牌>?format=surge`
 
 **XHTTP**：`?format=xhttp` 返回 `type=xhttp&mode=stream-one` 链接。服务端监听同一隧道路径的 **POST** 请求（与 WS 的 `Upgrade` 复用同一 path，靠 method 区分），出站复用竞速/假活/代理/SSRF 全套防护。
+
+**家宽链式**：先设 `jk=yes`（环境变量 / 面板），再访问 `?format=jk`。输出 CF 入口 × 每个家宽出口的全组合链式节点（`dialer-proxy`，客户端→家宽→CF→目标）。默认内置含**美国**的多出口池（占位）；真实节点用 `JK_NODE` 覆盖（JSON 数组）：
+
+```json
+[{"name":"US-LA-01","type":"ss","server":"1.2.3.4","port":443,"cipher":"aes-256-gcm","password":"xxx"}]
+```
+
+**Free CPU 保护**：`freeCpu=yes` 后，每条连接双向合计 ≤384 KiB 且 ≤96 个数据块，超限即断开（客户端自行重连），防止免费账号 CPU 超额。对新连接生效，不支持 path 覆盖。
 
 ### Path 级覆盖（单节点）
 

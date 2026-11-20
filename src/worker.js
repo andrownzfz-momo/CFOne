@@ -91,6 +91,15 @@ const MAX_UNAUTH_FIRST_PACKET = 64 * 1024;
 const MAX_CONN_MS = 15 * 60 * 1000; // 15 分钟
 const MAX_UPLOAD = 64 * 1024 * 1024; // 64 MiB
 const MAX_DOWNLOAD = 128 * 1024 * 1024; // 128 MiB
+// Free CPU 预算保护（与上游 cfnew 一致）：每条连接双向合计 ≤ 384 KiB 且 ≤ 96 个数据块
+const FREE_CPU_BYTES = 384 * 1024;
+const FREE_CPU_CHUNKS = 96;
+// 家宽链式（jk）默认出口池 —— 占位示例，含美国；真实使用请用 JK_NODE / JK_URL 覆盖
+const BUILTIN_JK_NODES = [
+  { name: 'US-LA-01', type: 'ss', server: 'us-la-01.jk.example.com', port: 443, cipher: 'aes-256-gcm', password: 'change-me' },
+  { name: 'US-NY-01', type: 'ss', server: 'us-ny-01.jk.example.com', port: 443, cipher: 'aes-256-gcm', password: 'change-me' },
+  { name: 'US-SJC-01', type: 'ss', server: 'us-sjc-01.jk.example.com', port: 443, cipher: 'aes-256-gcm', password: 'change-me' },
+];
 
 // 假活检测：客户端有数据后，上游首字节静默超时
 const STALL_TIMEOUT_MS = 3500;
@@ -202,6 +211,8 @@ function defaultConfig() {
     maskUrl: '',
     outboundPorts: [],
     api: false,
+    freeCpu: false, // Free CPU 预算保护（每连接 384KiB/96 块）
+    jk: false,      // 家宽链式订阅入口
     version: '',
   };
 }
@@ -226,8 +237,31 @@ function envConfig(env) {
     maskUrl: g('mask_url'),
     outboundPorts: parsePortList(g('outbound_ports')),
     api: g('ae').toLowerCase() === 'yes' || g('ae') === '1',
+    freeCpu: g('freecpu').toLowerCase() === 'yes' || g('freecpu') === '1' || g('freecpu') === 'on' || g('freecpu') === 'true',
+    jk: g('jk').toLowerCase() === 'yes' || g('jk') === '1' || g('jk') === 'on' || g('jk') === 'true',
+    jkNodes: parseJkNodes(g('jk_node')),
     version: '',
   };
+}
+
+// 解析家宽出口节点（JK_NODE）：JSON 数组；失败回退内置含美国的占位池
+function parseJkNodes(raw) {
+  if (!raw) return null;
+  try {
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr) && arr.length) {
+      return arr.filter((n) => n && n.server).map((n) => ({
+        name: String(n.name || n.server),
+        type: n.type === 'vmess' || n.type === 'trojan' ? n.type : 'ss',
+        server: String(n.server),
+        port: parseInt(n.port, 10) || 443,
+        cipher: n.cipher || 'aes-256-gcm',
+        password: n.password !== undefined ? String(n.password) : '',
+        uuid: n.uuid || undefined,
+      }));
+    }
+  } catch { /* 非法 JSON → 用默认池 */ }
+  return null;
 }
 
 function parsePortList(s) {
@@ -291,6 +325,8 @@ function mergedConfig(envCfg, kvCfg) {
       if (v !== undefined && v !== null && v !== '') {
         if (key === 'et') out.et = v === true || v === 'yes' || v === '1';
         else if (key === 'api') out.api = v === true || v === 'yes' || v === '1';
+        else if (key === 'freeCpu') out.freeCpu = v === true || v === 'yes' || v === '1' || v === 'on' || v === 'true';
+        else if (key === 'jk') out.jk = v === true || v === 'yes' || v === '1' || v === 'on' || v === 'true';
         else if (key === 'outboundPorts' && Array.isArray(v)) out.outboundPorts = v;
         else out[key] = String(v);
       }
@@ -494,6 +530,16 @@ async function handleTunnel(request, envCfg, cfg) {
   let protocol = null; // 'vless' | 'trojan'
   let upBytes = 0;
   let downBytes = 0;
+  // Free CPU 预算保护（每连接双向合计 384KiB / 96 块；不支持 path 覆盖）
+  const freeOn = !!cfg.freeCpu;
+  let freeBytes = 0;
+  let freeChunks = 0;
+  const chargeFree = (n) => {
+    if (!freeOn) return false;
+    freeBytes += n;
+    freeChunks += 1;
+    return freeBytes > FREE_CPU_BYTES || freeChunks > FREE_CPU_CHUNKS;
+  };
   const startedAt = nowMs();
   let upstream = null; // { socket, writer }
   let upstreamStallTimer = null;
@@ -536,6 +582,7 @@ async function handleTunnel(request, envCfg, cfg) {
         protocol = parsed.protocol;
         const payload = parsed.payload;
         upBytes += bytes.length;
+        if (chargeFree(bytes.length)) { clientClose(1009, 'free-cpu'); return; }
         const out = dialAndPipe(payload, parsed.target, pathCfg, onUpstreamData, onUpstreamError);
         return; // dialAndPipe 负责后续
       } catch (err) {
@@ -546,6 +593,7 @@ async function handleTunnel(request, envCfg, cfg) {
 
     upBytes += bytes.length;
     if (upBytes > MAX_UPLOAD) { clientClose(1009, 'up-limit'); return; }
+    if (chargeFree(bytes.length)) { clientClose(1009, 'free-cpu'); return; }
     if (upstream && upstream.writer) {
       upstream.writer.write(bytes).catch(() => clientClose(1011, 'up-write-fail'));
     }
@@ -564,6 +612,7 @@ async function handleTunnel(request, envCfg, cfg) {
     clearStall(); // 有数据即说明非假活，取消重拨定时器
     downBytes += chunk.length;
     if (downBytes > MAX_DOWNLOAD) { clientClose(1009, 'down-limit'); return; }
+    if (chargeFree(chunk.length)) { clientClose(1009, 'free-cpu'); return; }
     try { server.send(chunk); } catch { clientClose(1011, 'down-send-fail'); }
   }
   function onUpstreamError(code, reason) {
@@ -625,6 +674,17 @@ async function handleXhttp(request, envCfg, cfg) {
   const trojanEnabled = cfg.et;
   if (trojanEnabled) trojanHashCache = await sha224Hex(trojanPassword);
 
+  // Free CPU 预算保护（每连接 384KiB / 96 块）
+  const freeOn = !!cfg.freeCpu;
+  let freeBytes = 0;
+  let freeChunks = 0;
+  const chargeFree = (n) => {
+    if (!freeOn) return false;
+    freeBytes += n;
+    freeChunks += 1;
+    return freeBytes > FREE_CPU_BYTES || freeChunks > FREE_CPU_CHUNKS;
+  };
+
   // path 级覆盖（与 WS 一致）
   const u = new URL(request.url);
   const pathCfg = { ...cfg };
@@ -663,10 +723,14 @@ async function handleXhttp(request, envCfg, cfg) {
   // 3) 上行泵（后台）：先写首包 payload，再持续把请求 body 泵给上游
   (async () => {
     try {
-      if (parsed.payload && parsed.payload.length) await conn.writer.write(parsed.payload);
+      if (parsed.payload && parsed.payload.length) {
+        if (chargeFree(parsed.payload.length)) { try { conn.socket.close(); } catch {} return; }
+        await conn.writer.write(parsed.payload);
+      }
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
+        if (chargeFree(value.length)) { try { conn.socket.close(); } catch {} return; }
         await conn.writer.write(value);
       }
     } catch { /* 上行结束或对端关闭 */ }
@@ -684,6 +748,7 @@ async function handleXhttp(request, envCfg, cfg) {
           for (;;) {
             const { done, value } = await conn.reader.read();
             if (done) break;
+            if (chargeFree(value.length)) { try { conn.socket.close(); } catch {} break; }
             c.enqueue(value);
           }
         } catch { /* 上游读失败 */ }
@@ -1141,6 +1206,16 @@ async function handleSubscription(request, env, ctx, cfg) {
       body = buildXhttpLinks(nodes, host, wsPath, uuid, trojanEnabled, trojanPassword);
       contentType = 'text/plain; charset=utf-8';
       break;
+    case 'vg':
+    case 'jk':
+    case 'jiakuan':
+      // 家宽链式 Clash YAML（需 jk=yes；否则拒绝）
+      if (!cfg.jk) {
+        return new Response('jk-disabled', { status: 403, headers: { 'Cache-Control': 'no-store' } });
+      }
+      body = buildJkYaml(nodes, host, wsPath, uuid, trojanEnabled, trojanPassword, cfg.jkNodes);
+      contentType = 'text/yaml; charset=utf-8';
+      break;
     case 'singbox':
       body = buildSingBoxJson(nodes, host, wsPath, uuid, trojanEnabled, trojanPassword);
       contentType = 'application/json; charset=utf-8';
@@ -1483,6 +1558,94 @@ function buildXhttpLinks(nodes, host, wsPath, uuid, trojanEnabled, trojanPasswor
   return lines.join('\n') + '\n';
 }
 
+// ---- 家宽链式 Clash YAML（jk=yes 时可用）----
+// 结构：CF 入口节点经 dialer-proxy 指向家宽出口 —— 客户端 → 家宽 → CF → 目标
+// 家宽出口默认用内置含美国的占位池，可用 JK_NODE 覆盖
+function buildJkYaml(nodes, host, wsPath, uuid, trojanEnabled, trojanPassword, jkNodes) {
+  const jkList = (jkNodes && jkNodes.length ? jkNodes : BUILTIN_JK_NODES);
+  const jkPrefix = __SFX('家宽-');
+  const path = wsPath + '?ed=2048';
+  const lines = ['proxies:'];
+
+  // 1) 家宽出口节点（含美国）
+  const jkNames = [];
+  for (const j of jkList) {
+    const name = jkPrefix + j.name;
+    jkNames.push(name);
+    if (j.type === 'vmess') {
+      lines.push(
+        `  - name: "${name}"`, `    type: vmess`, `    server: ${j.server}`, `    port: ${j.port}`,
+        `    uuid: ${j.uuid || ''}`, `    cipher: auto`, `    tls: true`, `    servername: ${j.server}`
+      );
+    } else if (j.type === 'trojan') {
+      lines.push(
+        `  - name: "${name}"`, `    type: trojan`, `    server: ${j.server}`, `    port: ${j.port}`,
+        `    password: ${j.password}`, `    sni: ${j.server}`
+      );
+    } else {
+      lines.push(
+        `  - name: "${name}"`, `    type: ss`, `    server: ${j.server}`, `    port: ${j.port}`,
+        `    cipher: ${j.cipher}`, `    password: ${j.password}`
+      );
+    }
+  }
+
+  // 2) CF 入口 × 每个家宽出口 = 独立链式节点（多出口可选；dialer-proxy 方向）
+  const chainNames = [];
+  let chainCount = 0;
+  const MAX_JK_CHAINS = 300; // 防节点爆炸
+  for (let i = 0; i < nodes.length && chainCount < MAX_JK_CHAINS; i++) {
+    const n = nodes[i];
+    const base = `${n.name}-${String(i + 1).padStart(2, '0')}`;
+    for (let k = 0; k < jkNames.length && chainCount < MAX_JK_CHAINS; k++) {
+      const jkName = jkNames[k];
+      const jkShort = jkList[k].name; // 出口短名（US-LA-01 等），纯 ASCII
+      const chainName = `${base}-${jkShort}`;
+      chainNames.push(chainName);
+      chainCount++;
+      lines.push(
+        `  - name: "${chainName}"`, `    type: vless`, `    server: ${n.host}`, `    port: ${n.port}`,
+        `    uuid: ${uuid}`, `    network: ws`, `    tls: true`, `    servername: ${host}`,
+        `    ws-opts:`, `      path: "${path}"`, `      headers:`, `        Host: ${host}`,
+        `    udp: true`, `    dialer-proxy: "${jkName}"`
+      );
+      if (trojanEnabled && chainCount < MAX_JK_CHAINS) {
+        const tn = chainName + '-Trojan';
+        chainNames.push(tn);
+        chainCount++;
+        lines.push(
+          `  - name: "${tn}"`, `    type: trojan`, `    server: ${n.host}`, `    port: ${n.port}`,
+          `    password: ${trojanPassword}`, `    network: ws`, `    tls: true`, `    servername: ${host}`,
+          `    ws-opts:`, `      path: "${path}"`, `      headers:`, `        Host: ${host}`,
+          `    dialer-proxy: "${jkName}"`
+        );
+      }
+    }
+  }
+
+  // 3) 代理组：选链式节点
+  const selGroup = __SFX('🚀 家宽链式');
+  lines.push(
+    'proxy-groups:',
+    `  - name: "${selGroup}"`, `    type: select`, `    proxies:`
+  );
+  for (const nm of chainNames) lines.push(`      - "${nm}"`);
+
+  // 4) 规则
+  lines.push(
+    'rules:',
+    '  - "IP-CIDR,127.0.0.0/8,DIRECT"',
+    '  - "IP-CIDR,10.0.0.0/8,DIRECT"',
+    '  - "IP-CIDR,172.16.0.0/12,DIRECT"',
+    '  - "IP-CIDR,192.168.0.0/16,DIRECT"',
+    '  - "IP-CIDR6,::1/128,DIRECT"',
+    '  - "IP-CIDR6,fc00::/7,DIRECT"',
+    `  - "MATCH,${selGroup}"`,
+    ''
+  );
+  return lines.join('\n');
+}
+
 /* ================================================================== *
  *  7. 面板（登录 + 配置 + 优选管理）
  * ================================================================== */
@@ -1633,17 +1796,19 @@ function panelSafeConfig(cfg) {
     maskHtml: cfg.maskHtml,
     maskUrl: cfg.maskUrl,
     api: cfg.api,
+    freeCpu: cfg.freeCpu,
+    jk: cfg.jk,
   };
 }
 
 // 面板写入配置的白名单清洗
 function sanitizeConfig(input) {
   const out = {};
-  const keys = ['uuid', 'trojanPassword', 'et', 'wsPath', 'proxyip', 's', 'qj', 'yx', 'yxURL', 'maskHtml', 'maskUrl', 'api'];
+  const keys = ['uuid', 'trojanPassword', 'et', 'wsPath', 'proxyip', 's', 'qj', 'yx', 'yxURL', 'maskHtml', 'maskUrl', 'api', 'freeCpu', 'jk'];
   for (const k of keys) {
     const v = input[k];
     if (v === undefined || v === null) continue;
-    if (k === 'et' || k === 'api') out[k] = v === true || v === 'yes' || v === '1' || v === 'on';
+    if (k === 'et' || k === 'api' || k === 'freeCpu' || k === 'jk') out[k] = v === true || v === 'yes' || v === '1' || v === 'on' || v === 'true';
     else out[k] = String(v).slice(0, 16384);
   }
   if (out.wsPath && !out.wsPath.startsWith('/')) out.wsPath = '/' + out.wsPath;

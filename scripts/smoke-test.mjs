@@ -152,6 +152,30 @@ console.log('=== CFOne 冒烟测试 ===\n');
   const subUaSurge = await call(subPath, env, { req: { headers: { 'User-Agent': 'Surge/5.0' } } });
   const tUaSurge = await subUaSurge.text();
   check('UA 自适应 Surge → INI', subUaSurge.status === 200 && tUaSurge.includes('[Proxy]'));
+
+  // ---- 家宽链式（jk=yes）----
+  env.jk = 'yes';
+  const subJk = await call(subPath + '?format=jk', env, { req: { headers: { 'User-Agent': 'clash' } } });
+  const tJk = await subJk.text();
+  check('家宽链式返回 YAML', subJk.status === 200 && tJk.includes('proxies:'));
+  check('家宽含 dialer-proxy 链式', tJk.includes('dialer-proxy'));
+  check('家宽含美国出口', tJk.includes('US-LA-01') || tJk.includes('US-NY-01') || tJk.includes('US-SJC-01'));
+  check('家宽多出口(dialer-proxy≥2)', (tJk.match(/dialer-proxy/g) || []).length >= 2);
+
+  // jk 未开启 → 403
+  const envNoJk = makeEnv();
+  const subJkOff = await call(subPath + '?format=jk', envNoJk, { req: { headers: { 'User-Agent': 'clash' } } });
+  check('jk 未开启返回 403', subJkOff.status === 403);
+
+  // ---- Free CPU 配置透传 ----
+  const envF = makeEnv();
+  envF.freecpu = 'yes';
+  const loginF = await call('/' + PASSWORD + '/api/login', envF, {
+    req: { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: PASSWORD }) },
+  });
+  const cookieF = loginF.headers.get('set-cookie').split(';')[0];
+  const cfgF = await (await call('/' + PASSWORD + '/api/config', envF, { req: { headers: { cookie: cookieF } } })).json();
+  check('Free CPU 配置读取', cfgF.config ? cfgF.config.freeCpu === true : cfgF.freeCpu === true);
 }
 
 // 6. 错误订阅令牌 → 伪装页
