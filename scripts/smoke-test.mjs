@@ -126,6 +126,32 @@ console.log('=== CFOne 冒烟测试 ===\n');
   });
   const subText3 = await subRes3.text();
   check('订阅返回 base64', subRes3.status === 200 && subText3.length > 0 && !subText3.includes('vless://'));
+
+  // ---- 新增格式：Stash / Surge / Loon / QuantumultX / XHTTP ----
+  const subStash = await call(subPath + '?format=stash', env, { req: { headers: { 'User-Agent': 'stash' } } });
+  const tStash = await subStash.text();
+  check('订阅返回 Stash(Clash兼容) YAML', subStash.status === 200 && tStash.includes('proxies:'));
+
+  const subSurge = await call(subPath + '?format=surge', env, { req: { headers: { 'User-Agent': 'surge' } } });
+  const tSurge = await subSurge.text();
+  check('订阅返回 Surge INI', subSurge.status === 200 && tSurge.includes('[Proxy]') && tSurge.includes('vless,'));
+
+  const subLoon = await call(subPath + '?format=loon', env, { req: { headers: { 'User-Agent': 'loon' } } });
+  const tLoon = await subLoon.text();
+  check('订阅返回 Loon INI', subLoon.status === 200 && tLoon.includes('[Proxy]') && tLoon.includes('server='));
+
+  const subQx = await call(subPath + '?format=qx', env, { req: { headers: { 'User-Agent': 'Quantumult' } } });
+  const tQx = await subQx.text();
+  check('订阅返回 QuantumultX', subQx.status === 200 && tQx.includes('[server_local]'));
+
+  const subXhttp = await call(subPath + '?format=xhttp', env, { req: { headers: { 'User-Agent': 'plain' } } });
+  const tXhttp = await subXhttp.text();
+  check('订阅返回 XHTTP 链接', subXhttp.status === 200 && tXhttp.includes('type=xhttp') && tXhttp.includes('stream-one'));
+
+  // UA 自适应：Surge UA 应命中 surge 格式（非 clash）
+  const subUaSurge = await call(subPath, env, { req: { headers: { 'User-Agent': 'Surge/5.0' } } });
+  const tUaSurge = await subUaSurge.text();
+  check('UA 自适应 Surge → INI', subUaSurge.status === 200 && tUaSurge.includes('[Proxy]'));
 }
 
 // 6. 错误订阅令牌 → 伪装页

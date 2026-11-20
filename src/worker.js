@@ -442,6 +442,14 @@ async function route(request, env, ctx) {
     return maskResponse(request, env, ctx, 404);
   }
 
+  // 3b) XHTTP 隧道入口（POST 到隧道路径 = VLESS-XHTTP stream-one，非 WS 升级）
+  if (method === 'POST' && pw) {
+    const cfg = await loadCfg(env);
+    if (path === cfg.wsPath) {
+      return handleXhttp(request, envCfg, cfg);
+    }
+  }
+
   // 4) 其它：伪装页（不读 KV）
   return maskResponse(request, env, ctx, method === 'GET' ? 200 : 405);
 }
@@ -605,6 +613,98 @@ async function handleTunnel(request, envCfg, cfg) {
   };
 
   return new Response(null, { status: 101, webSocket: client });
+}
+
+/* ---- VLESS XHTTP（stream-one）----
+ * 客户端 POST 到隧道路径，请求 body = 上行流，响应 body = 下行流。
+ * 与 WS 共用同一 path，靠 method / upgrade 头区分（POST 无 upgrade → XHTTP）。
+ * 复用 parseProxyHeader 解析首包、dialOutbound 出站（含竞速/假活/代理/SSRF 防护）。 */
+async function handleXhttp(request, envCfg, cfg) {
+  const uuid = cfg.uuid;
+  const trojanPassword = cfg.trojanPassword || uuid;
+  const trojanEnabled = cfg.et;
+  if (trojanEnabled) trojanHashCache = await sha224Hex(trojanPassword);
+
+  // path 级覆盖（与 WS 一致）
+  const u = new URL(request.url);
+  const pathCfg = { ...cfg };
+  if (u.searchParams.get('pyip')) pathCfg.proxyip = u.searchParams.get('pyip');
+  if (u.searchParams.get('s')) pathCfg.s = u.searchParams.get('s');
+  if (u.searchParams.get('qj')) pathCfg.qj = u.searchParams.get('qj');
+
+  if (!request.body) return new Response('no-body', { status: 400 });
+
+  // 1) 读 body 直到能解析出首包（数据不足 parseProxyHeader 返回 null，继续读）
+  const reader = request.body.getReader();
+  let buf = new Uint8Array(0);
+  let parsed = null;
+  const MAX_HDR = 4096; // 正常首包远小于此；无效数据靠它兜底拒绝
+  while (!parsed) {
+    let r;
+    try { r = await reader.read(); } catch { return new Response('bad-read', { status: 400 }); }
+    if (r.done) return new Response('bad-header', { status: 400 });
+    const nb = new Uint8Array(buf.length + r.value.length);
+    nb.set(buf, 0);
+    nb.set(r.value, buf.length);
+    buf = nb;
+    if (buf.length > MAX_HDR) return new Response('bad-header', { status: 400 });
+    try { parsed = parseProxyHeader(buf, uuid, trojanPassword, trojanEnabled); }
+    catch { parsed = null; }
+  }
+
+  // 2) 拨号出站
+  let conn;
+  try {
+    conn = await dialOutbound(parsed.target, pathCfg, { deadline: nowMs() + 20000 });
+  } catch {
+    return new Response('dial-fail', { status: 502 });
+  }
+
+  // 3) 上行泵（后台）：先写首包 payload，再持续把请求 body 泵给上游
+  (async () => {
+    try {
+      if (parsed.payload && parsed.payload.length) await conn.writer.write(parsed.payload);
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        await conn.writer.write(value);
+      }
+    } catch { /* 上行结束或对端关闭 */ }
+    try { conn.writer.close(); } catch { /* ignore */ }
+  })();
+
+  // 4) 下行流：竞速首字节 first + 后续上游数据 → 响应 body
+  const down = new ReadableStream({
+    start(c) {
+      if (conn.first && conn.first.length) {
+        try { c.enqueue(conn.first); } catch { /* ignore */ }
+      }
+      const pump = async () => {
+        try {
+          for (;;) {
+            const { done, value } = await conn.reader.read();
+            if (done) break;
+            c.enqueue(value);
+          }
+        } catch { /* 上游读失败 */ }
+        try { c.close(); } catch { /* ignore */ }
+        try { conn.socket.close(); } catch { /* ignore */ }
+      };
+      pump();
+    },
+    cancel() {
+      try { conn.socket.close(); } catch { /* ignore */ }
+    },
+  });
+
+  return new Response(down, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'Cache-Control': 'no-store',
+      'X-Accel-Buffering': 'no',
+    },
+  });
 }
 
 // 上游读取泵：持续读 TCP 并回调（conn.first 为竞速阶段已消费的首字节 / 代理握手残余数据）
@@ -995,8 +1095,16 @@ async function handleSubscription(request, env, ctx, cfg) {
 
   const format =
     url.searchParams.get('format') ||
-    (ua.includes('clash') || ua.includes('mihomo') || ua.includes('verge') || ua.includes('stash') || ua.includes('karing') || ua.includes('surge') || ua.includes('loon') || ua.includes('quantumult')
+    (ua.includes('clash') || ua.includes('mihomo') || ua.includes('verge') || ua.includes('karing')
       ? 'clash'
+      : ua.includes('stash')
+      ? 'stash'
+      : ua.includes('surge')
+      ? 'surge'
+      : ua.includes('loon')
+      ? 'loon'
+      : ua.includes('quantumult')
+      ? 'qx'
       : ua.includes('sing-box') || ua.includes('singbox')
       ? 'singbox'
       : ua.includes('v2ray') || ua.includes('shadowrocket') || ua.includes('nekobox') || ua.includes('nekoray') || ua.includes('v2rayng')
@@ -1010,6 +1118,28 @@ async function handleSubscription(request, env, ctx, cfg) {
     case 'clash':
       body = buildClashYaml(nodes, host, wsPath, uuid, trojanEnabled, trojanPassword);
       contentType = 'text/yaml; charset=utf-8';
+      break;
+    case 'stash':
+      // Stash 兼容 Clash YAML，独立入口便于按格式订阅
+      body = buildClashYaml(nodes, host, wsPath, uuid, trojanEnabled, trojanPassword);
+      contentType = 'text/yaml; charset=utf-8';
+      break;
+    case 'surge':
+      body = buildSurgeConf(nodes, host, wsPath, uuid, trojanEnabled, trojanPassword);
+      contentType = 'text/plain; charset=utf-8';
+      break;
+    case 'loon':
+      body = buildLoonConf(nodes, host, wsPath, uuid, trojanEnabled, trojanPassword);
+      contentType = 'text/plain; charset=utf-8';
+      break;
+    case 'qx':
+      body = buildQxConf(nodes, host, wsPath, uuid, trojanEnabled, trojanPassword);
+      contentType = 'text/plain; charset=utf-8';
+      break;
+    case 'xhttp':
+      // VLESS-XHTTP stream-one 链接（服务端 POST 到隧道路径）
+      body = buildXhttpLinks(nodes, host, wsPath, uuid, trojanEnabled, trojanPassword);
+      contentType = 'text/plain; charset=utf-8';
       break;
     case 'singbox':
       body = buildSingBoxJson(nodes, host, wsPath, uuid, trojanEnabled, trojanPassword);
@@ -1253,6 +1383,104 @@ function buildSingBoxJson(nodes, host, wsPath, uuid, trojanEnabled, trojanPasswo
     },
   };
   return JSON.stringify(json, null, 2);
+}
+
+// ---- Surge 配置（INI，支持 vless-ws / trojan-ws）----
+function buildSurgeConf(nodes, host, wsPath, uuid, trojanEnabled, trojanPassword) {
+  const path = wsPath + '?ed=2048';
+  const lines = ['[General]', 'loglevel = notify', '', '[Proxy]'];
+  nodes.forEach((n, i) => {
+    const name = `${n.name}-${String(i + 1).padStart(2, '0')}`;
+    lines.push(
+      `${name} = vless, ${n.host}, ${n.port}, username=${uuid}, tls=true, sni=${host}, skip-cert-verify=false, ws=true, ws-path=${path}, ws-headers=Host: ${host}`
+    );
+    if (trojanEnabled) {
+      lines.push(
+        `${name}-Trojan = trojan, ${n.host}, ${n.port}, password=${trojanPassword}, tls=true, sni=${host}, skip-cert-verify=false, ws=true, ws-path=${path}, ws-headers=Host: ${host}`
+      );
+    }
+  });
+  const names = nodes.map((n, i) => `${n.name}-${String(i + 1).padStart(2, '0')}`);
+  lines.push(
+    '',
+    '[Proxy Group]',
+    `${__SFX('🚀 节点选择')} = select, ${names.join(', ')}`,
+    `${__SFX('♻️ 自动选择')} = url-test, ${names.join(', ')}, url=http://www.gstatic.com/generate_204, interval=300`,
+    '',
+    '[Rule]',
+    'IP-CIDR,127.0.0.0/8,DIRECT,no-resolve',
+    'IP-CIDR,10.0.0.0/8,DIRECT,no-resolve',
+    'IP-CIDR,172.16.0.0/12,DIRECT,no-resolve',
+    'IP-CIDR,192.168.0.0/16,DIRECT,no-resolve',
+    `FINAL, ${__SFX('🚀 节点选择')}`,
+    ''
+  );
+  return lines.join('\n');
+}
+
+// ---- Loon 配置（INI key=value）----
+function buildLoonConf(nodes, host, wsPath, uuid, trojanEnabled, trojanPassword) {
+  const path = wsPath + '?ed=2048';
+  const lines = ['[General]', '', '[Proxy]'];
+  nodes.forEach((n, i) => {
+    const name = `${n.name}-${String(i + 1).padStart(2, '0')}`;
+    lines.push(
+      `${name} = vless,server=${n.host},port=${n.port},username=${uuid},tls=true,over-tls=true,ws=true,ws-path=${path},ws-headers=Host:${host}`
+    );
+    if (trojanEnabled) {
+      lines.push(
+        `${name}-Trojan = trojan,server=${n.host},port=${n.port},password=${trojanPassword},tls=true,over-tls=true,ws=true,ws-path=${path},ws-headers=Host:${host}`
+      );
+    }
+  });
+  const names = nodes.map((n, i) => `${n.name}-${String(i + 1).padStart(2, '0')}`);
+  lines.push(
+    '',
+    '[Remote]',
+    `${__SFX('🚀 节点选择')} = select,${names.join(',')}`,
+    `${__SFX('♻️ 自动选择')} = url-test,${names.join(',')},policy-interval=300,url=http://www.gstatic.com/generate_204`,
+    '',
+    '[Rule]',
+    'IP-CIDR,127.0.0.0/8,DIRECT,no-resolve',
+    'IP-CIDR,10.0.0.0/8,DIRECT,no-resolve',
+    'IP-CIDR,172.16.0.0/12,DIRECT,no-resolve',
+    'IP-CIDR,192.168.0.0/16,DIRECT,no-resolve',
+    `FINAL,${__SFX('🚀 节点选择')}`,
+    ''
+  );
+  return lines.join('\n');
+}
+
+// ---- Quantumult X 配置（server_local 段）----
+function buildQxConf(nodes, host, wsPath, uuid, trojanEnabled, trojanPassword) {
+  const path = wsPath + '?ed=2048';
+  const lines = ['[general]', 'profile = 1', '', '[server_local]'];
+  nodes.forEach((n, i) => {
+    const name = `${n.name}-${String(i + 1).padStart(2, '0')}`;
+    lines.push(
+      `vless=${n.host}:${n.port}, method=none, password=${uuid}, obfs=ws, obfs-host=${host}, obfs-uri=${path}, tls=true, tag=${name}`
+    );
+    if (trojanEnabled) {
+      lines.push(
+        `trojan=${n.host}:${n.port}, password=${trojanPassword}, obfs=ws, obfs-host=${host}, obfs-uri=${path}, tls=true, tag=${name}-Trojan`
+      );
+    }
+  });
+  lines.push('', '[filter_local]', 'final = ' + __SFX('🚀 节点选择'), '');
+  return lines.join('\n');
+}
+
+// ---- VLESS-XHTTP (stream-one) 分享链接 ----
+function linkVlessXhttp(ip, port, host, wsPath, uuid) {
+  const path = encodeURIComponent(wsPath);
+  return `vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${encodeURIComponent(host)}&fp=chrome&type=xhttp&mode=stream-one&path=${path}&host=${encodeURIComponent(host)}#${encodeURIComponent(nameOf(ip))}`;
+}
+function buildXhttpLinks(nodes, host, wsPath, uuid, trojanEnabled, trojanPassword) {
+  const lines = [];
+  for (const n of nodes) {
+    lines.push(linkVlessXhttp(n.host, n.port, host, wsPath, uuid));
+  }
+  return lines.join('\n') + '\n';
 }
 
 /* ================================================================== *

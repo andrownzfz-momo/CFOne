@@ -10,7 +10,8 @@
 | **部署** | 单文件双形态：Worker 粘贴 / Pages Advanced Mode，必填仅 `A` 一个变量 |
 | **稳定** | 无关请求零 KV 读取、10 秒窗口合并缓存、配置版本号失效；出站候选竞速 + 假活检测（无首字节即换路）；WS close reason 123 字节截断；连接/流量上限保护 |
 | **安全** | PBKDF2 口令散列 + HttpOnly 会话 + 常量时间比较 + IP 限速；订阅签名令牌与面板密码分离；SSRF 防护（拒绝内网/回环/保留段）；构建时静态脱敏（中文/品牌名零明文残留） |
-| **订阅** | UA 自动识别：Clash/Mihomo → YAML · sing-box → JSON · v2rayN/NekoBox → Base64 · 浏览器 → 明文；也支持 `?format=` 显式指定 |
+| **订阅** | UA 自动识别 + 显式 `?format=`：**Clash / Stash / sing-box / Surge / Loon / QuantumultX / XHTTP / Base64 / 明文** 共 9 种；Clash·Mihomo·Verge·Karing→YAML · Stash→YAML · Surge→INI · Loon→INI · Quantumult→QX · sing-box→JSON · v2rayN·Shadowrocket·NekoBox→Base64 · 浏览器→明文 |
+| **协议** | VLESS/WS、Trojan/WS、**VLESS-XHTTP（stream-one）**；XHTTP 与 WS 共用路径，靠 method 区分（POST→XHTTP、Upgrade→WS） |
 | **出站** | 直连 / ProxyIP 竞速、SOCKS5 / HTTP / HTTPS 代理、出站方式三选一（竞速/直连优先/只走代理）；Path 级 `pyip` / `s` / `qj` 单节点覆盖 |
 | **面板** | 图形化管理：UUID、WS 路径、Trojan 开关、ProxyIP、出站代理、优选 IP 列表（KV 持久化）、伪装页 |
 
@@ -336,6 +337,26 @@ https://<Worker名>.<账号子域>.workers.dev/<步骤4设置的A值>
 2. 在「优选节点」页填写优选 IP（或留空用内置池）
 3. 在「设置」页配置 UUID、WS 路径、Trojan、出站等
 4. 在「概览」页复制订阅地址，导入客户端
+
+### 订阅格式（9 种）
+
+订阅地址默认按客户端 UA 自动适配；也可显式加 `?format=` 指定：
+
+| `format=` | 输出 | 适配客户端 |
+| --- | --- | --- |
+| `clash` | Clash YAML | Clash / Mihomo / Verge / Karing |
+| `stash` | Clash 兼容 YAML | Stash |
+| `surge` | Surge INI | Surge |
+| `loon` | Loon INI | Loon |
+| `qx` | QuantumultX 配置 | Quantumult X |
+| `singbox` | sing-box JSON | sing-box |
+| `xhttp` | VLESS-XHTTP 链接 | 支持 XHTTP 的客户端 |
+| `base64` | Base64 链接集 | v2rayN / Shadowrocket / NekoBox |
+| `plain` | 明文链接集 | 浏览器 / 通用 |
+
+例：`https://<部署地址>/s/<订阅令牌>?format=surge`
+
+**XHTTP**：`?format=xhttp` 返回 `type=xhttp&mode=stream-one` 链接。服务端监听同一隧道路径的 **POST** 请求（与 WS 的 `Upgrade` 复用同一 path，靠 method 区分），出站复用竞速/假活/代理/SSRF 全套防护。
 
 ### Path 级覆盖（单节点）
 
