@@ -2,6 +2,9 @@
 node_modules/
 *.log
 
+# 构建依赖（build.mjs 使用，不入库）
+scripts/.deps/
+
 # 上游参考仓库（克隆用于分析，不入库）
 upstream/
 

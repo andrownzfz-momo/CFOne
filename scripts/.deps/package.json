@@ -1,7 +1,0 @@
-{
-  "name": "cfone-deps",
-  "private": true,
-  "dependencies": {
-    "@noble/hashes": "^2.4.0"
-  }
-}
